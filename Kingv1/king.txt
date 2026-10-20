@@ -1,0 +1,1796 @@
+# ============================================================
+#  King v1 - CMD Style Transparent Menu
+#  [1] APPLY ALL  |  [2] CLEAN  |  [3] RESTORE  |  [0] EXIT
+# ============================================================
+#Requires -Version 5.1
+$ErrorActionPreference = 'SilentlyContinue'
+
+# --- Elevate to Admin ---
+$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $IsAdmin) {
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
+    if ($scriptPath) {
+        Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File","`"$scriptPath`"") -Verb RunAs
+    }
+    exit
+}
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
+
+# --- State ---
+$Global:StateDir  = Join-Path $env:LOCALAPPDATA "SyncProject-FiveMOptimize"
+$Global:StateFile = Join-Path $Global:StateDir "state.json"
+$Global:Orig      = @{}
+$Global:OrigServices = @{}
+$Global:OrigMisc  = @{}
+$Global:AppliedKeys = @{}
+$Global:LogLines  = [System.Collections.Generic.List[string]]::new()
+
+function Save-TweakState {
+    try {
+        if (-not (Test-Path $Global:StateDir)) { New-Item -Path $Global:StateDir -ItemType Directory -Force | Out-Null }
+        $json = @{ Orig = $Global:Orig; OrigServices = $Global:OrigServices; OrigMisc = $Global:OrigMisc; AppliedKeys = $Global:AppliedKeys } | ConvertTo-Json -Depth 10
+        $json | Set-Content -Path $Global:StateFile -Encoding UTF8 -ErrorAction Stop
+    } catch {}
+}
+
+function ConvertTo-HashtableDeep($obj) {
+    if ($null -eq $obj) { return $null }
+    if ($obj -is [System.Collections.IDictionary]) {
+        $h = @{}; foreach ($k in $obj.Keys) { $h[$k] = ConvertTo-HashtableDeep $obj[$k] }; return $h
+    }
+    if ($obj -is [PSCustomObject]) {
+        $h = @{}; foreach ($p in $obj.PSObject.Properties) { $h[$p.Name] = ConvertTo-HashtableDeep $p.Value }; return $h
+    }
+    if (($obj -is [System.Collections.IEnumerable]) -and ($obj -isnot [string])) {
+        return @($obj | ForEach-Object { ConvertTo-HashtableDeep $_ })
+    }
+    return $obj
+}
+
+function Load-TweakState {
+    try {
+        if (Test-Path $Global:StateFile) {
+            $rawText = Get-Content -Path $Global:StateFile -Raw -ErrorAction Stop
+            $json = $null
+            try { $json = $rawText | ConvertFrom-Json -ErrorAction Stop } catch {
+                try {
+                    $encoded = ""; foreach ($char in $rawText.ToCharArray()) { $encoded += [char]([int]$char -bxor 0x13) }
+                    $bytes = [System.Convert]::FromBase64String($encoded)
+                    $jsonStr = [System.Text.Encoding]::UTF8.GetString($bytes)
+                    $json = $jsonStr | ConvertFrom-Json -ErrorAction Stop
+                } catch {}
+            }
+            if ($json) {
+                if ($json.Orig)          { $Global:Orig          = ConvertTo-HashtableDeep $json.Orig }
+                if ($json.OrigServices)  { $Global:OrigServices  = ConvertTo-HashtableDeep $json.OrigServices }
+                if ($json.OrigMisc)      { $Global:OrigMisc      = ConvertTo-HashtableDeep $json.OrigMisc }
+                if ($json.AppliedKeys)   { $Global:AppliedKeys   = ConvertTo-HashtableDeep $json.AppliedKeys }
+            }
+        }
+    } catch {}
+}
+Load-TweakState
+
+# --- Helpers ---
+function Get-RegValue($path, $name) {
+    try {
+        if (Test-Path $path) {
+            $item = Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue
+            if ($null -ne $item) { return $item.$name }
+        }
+    } catch {}
+    return $null
+}
+
+function Set-RegValue($path, $name, $value, $type = "DWord") {
+    try {
+        if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+        if ($type -eq "String") {
+            Set-ItemProperty -Path $path -Name $name -Value $value -Type String -Force -ErrorAction Stop
+        } else {
+            Set-ItemProperty -Path $path -Name $name -Value $value -Type DWord -Force -ErrorAction Stop
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Save-Orig($key, $path, $name) {
+    if (-not $Global:Orig.ContainsKey($key)) {
+        $Global:Orig[$key] = @{ Path = $path; Name = $name; Value = (Get-RegValue $path $name) }
+    }
+}
+
+function Save-OrigService($key, $svcName) {
+    if (-not $Global:OrigServices.ContainsKey($key)) {
+        try {
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc) {
+                $cim = Get-CimInstance Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
+                $Global:OrigServices[$key] = @{
+                    ServiceName = $svcName
+                    StartType   = if ($cim) { $cim.StartMode } else { $svc.StartType.ToString() }
+                    Status      = $svc.Status.ToString()
+                }
+            }
+        } catch {}
+    }
+}
+
+function Restore-OrigService($info) {
+    try {
+        $name = $info.ServiceName
+        if (-not $name) { return }
+        $st = $info.StartType
+        $wasRunning = ($info.Status -eq "Running")
+        if ($st) {
+            $mapped = switch ($st) { "Auto" { "Automatic" }; "Automatic" { "Automatic" }; "Manual" { "Manual" }; "Disabled" { "Disabled" }; default { "Manual" } }
+            Set-Service -Name $name -StartupType $mapped -ErrorAction SilentlyContinue
+        }
+        if ($wasRunning) { Start-Service -Name $name -ErrorAction SilentlyContinue }
+    } catch {}
+}
+
+function Add-Log([string]$msg, [string]$color = "#A3E635") {
+    $ts = Get-Date -Format "HH:mm:ss"
+    $line = "[$ts] $msg"
+    $Global:LogLines.Add($line)
+    if ($Global:LogBox) {
+        $Global:LogBox.Dispatcher.Invoke([Action]{
+            $Global:LogBox.Text += "$line`n"
+            $Global:LogScroller.ScrollToEnd()
+        })
+    }
+}
+
+function Set-Status([string]$text) {
+    if ($Global:StatusText) {
+        $Global:StatusText.Dispatcher.Invoke([Action]{ $Global:StatusText.Text = $text })
+    }
+}
+
+# ============================================================
+#  APPLY ALL - Recommended FiveM profile
+# ============================================================
+function Invoke-ApplyAll {
+    Set-Status "APPLYING..."
+    Add-Log "=== APPLY ALL - Queen Project v2 Profile ===" "#E879F9"
+    $Global:AppliedKeys = @{}
+
+    # --- Network ---
+    try {
+        $p = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+        Save-Orig "NetThrottle" $p "NetworkThrottlingIndex"
+        Set-RegValue $p "NetworkThrottlingIndex" 0xFFFFFFFF | Out-Null
+        Set-RegValue $p "SystemResponsiveness" 0 | Out-Null
+        Add-Log "Network throttling disabled"
+    } catch { Add-Log "Network throttle skipped" "#F87171" }
+
+    try {
+        netsh int tcp set global autotuninglevel=normal rss=enabled ecncapability=enabled fastopen=enabled congestionprovider=ctcp 2>&1 | Out-Null
+        Add-Log "TCP global stack optimized"
+    } catch { Add-Log "TCP global failed" "#F87171" }
+
+    try {
+        $p = "HKLM:\SYSTEM\ControlSet001\Services\Ndu"
+        Save-Orig "NduDisable" $p "Start"
+        Set-RegValue $p "Start" 4 | Out-Null
+        Add-Log "Ndu driver disabled"
+    } catch {}
+
+    try {
+        $ifRoot = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+        $ifaces = Get-ChildItem -Path $ifRoot -ErrorAction SilentlyContinue
+        foreach ($i in $ifaces) {
+            Save-Orig "NET_NoNagle_$($i.PSChildName)_Ack" $i.PSPath "TcpAckFrequency"
+            Save-Orig "NET_NoNagle_$($i.PSChildName)_Delay" $i.PSPath "TCPNoDelay"
+            Set-RegValue $i.PSPath "TcpAckFrequency" 1 | Out-Null
+            Set-RegValue $i.PSPath "TCPNoDelay" 1 | Out-Null
+        }
+        Add-Log "Nagle disabled on adapters"
+    } catch {}
+
+    try {
+        $ups = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
+        foreach ($a in $ups) {
+            Disable-NetAdapterPowerManagement -Name $a.Name -ErrorAction SilentlyContinue
+            Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName "Energy-Efficient Ethernet" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+        }
+        Add-Log "Adapter power saving off"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+        Save-Orig "NET_TcpTimedWait" $p "TcpTimedWaitDelay"
+        Set-RegValue $p "TcpTimedWaitDelay" 30 | Out-Null
+        Add-Log "TCP TIME_WAIT -> 30s"
+    } catch {}
+
+    try {
+        netsh int ipv4 set dynamicport tcp start=10000 num=55536 2>&1 | Out-Null
+        netsh int ipv4 set dynamicport udp start=10000 num=55536 2>&1 | Out-Null
+        netsh int ipv6 set dynamicport tcp start=10000 num=55536 2>&1 | Out-Null
+        netsh int ipv6 set dynamicport udp start=10000 num=55536 2>&1 | Out-Null
+        Add-Log "Dynamic port range widened"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
+        Save-Orig "NET_QoSReserve" $p "NonBestEffortLimit"
+        Set-RegValue $p "NonBestEffortLimit" 0 | Out-Null
+        Add-Log "QoS reserved bandwidth -> 0%"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config"
+        Save-Orig "NET_DeliveryOptOff" $p "DODownloadMode"
+        Set-RegValue $p "DODownloadMode" 0 | Out-Null
+        Add-Log "Delivery Optimization P2P off"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters"
+        Save-Orig "NET_DnsCacheAggressive_MaxTtl" $p "MaxCacheTtl"
+        Save-Orig "NET_DnsCacheAggressive_NegTtl" $p "MaxNegativeCacheTtl"
+        Set-RegValue $p "MaxCacheTtl" 86400 | Out-Null
+        Set-RegValue $p "MaxNegativeCacheTtl" 5 | Out-Null
+        Restart-Service dnscache -Force -ErrorAction SilentlyContinue
+        Add-Log "DNS cache aggressive"
+    } catch {}
+
+    # IPv6 transition
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\TCPIP6\Teredo"
+        foreach ($n in @("Teredo_State","6to4_State","IPHTTPS_State","ISATAP_State")) {
+            Save-Orig "NET_Ipv6Transition_$n" $p $n
+            Set-RegValue $p $n "Disabled" "String" | Out-Null
+        }
+        Add-Log "IPv6 transition tech disabled"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+        Save-Orig "NET_DnsClientPolicy_Multicast" $p "EnableMulticast"
+        Set-RegValue $p "EnableMulticast" 0 | Out-Null
+        Save-Orig "NET_DnsClientPolicy_SmartMultiHomed" $p "DisableSmartNameResolution"
+        Set-RegValue $p "DisableSmartNameResolution" 1 | Out-Null
+        Add-Log "DNS multicast / smart resolution off"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\LLTD"
+        Save-Orig "NET_LltdDisable_IO" $p "EnableLLTDIO"
+        Set-RegValue $p "EnableLLTDIO" 0 | Out-Null
+        Save-Orig "NET_LltdDisable_Rspndr" $p "EnableRspndr"
+        Set-RegValue $p "EnableRspndr" 0 | Out-Null
+        Add-Log "LLTD disabled"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS"
+        Save-Orig "NET_BitsNoLimit" $p "EnableBITSMaxBandwidth"
+        Set-RegValue $p "EnableBITSMaxBandwidth" 0 | Out-Null
+        Add-Log "BITS bandwidth limit removed"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet"
+        Save-Orig "NET_NcsiNoActiveProbe" $p "EnableActiveProbing"
+        Set-RegValue $p "EnableActiveProbing" 0 | Out-Null
+        Add-Log "NCSI active probe off"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\SystemCertificates\AuthRoot"
+        Save-Orig "NET_NoAutoRootCertUpdate" $p "DisableRootAutoUpdate"
+        Set-RegValue $p "DisableRootAutoUpdate" 1 | Out-Null
+        Add-Log "Auto root cert update off"
+    } catch {}
+
+    try {
+        $base = "HKLM:\SYSTEM\CurrentControlSet\services\NetBT\Parameters\Interfaces"
+        $ifaces = Get-ChildItem -Path $base -ErrorAction SilentlyContinue
+        foreach ($i in $ifaces) {
+            Save-Orig "NET_NetbiosDisable_$($i.PSChildName)" $i.PSPath "NetbiosOptions"
+            Set-RegValue $i.PSPath "NetbiosOptions" 2 | Out-Null
+        }
+        Add-Log "NetBIOS over TCP/IP disabled"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance"
+        Save-Orig "NET_RemoteAssistanceOff" $p "fAllowToGetHelp"
+        Set-RegValue $p "fAllowToGetHelp" 0 | Out-Null
+        Add-Log "Remote Assistance disabled"
+    } catch {}
+
+    # Killer NIC
+    try {
+        $killerSvcs = Get-CimInstance Win32_Service -Filter "Name LIKE '%Killer%'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ServiceType -notmatch "Kernel|FileSystem" }
+        if ($killerSvcs) {
+            foreach ($svc in $killerSvcs) {
+                Save-OrigService "NET_KillerFix_$($svc.Name)" $svc.Name
+                Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction SilentlyContinue
+                Add-Log "Killer service disabled: $($svc.DisplayName)"
+            }
+        }
+    } catch {}
+
+    # FiveM QoS
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\QoS"
+        Save-Orig "NET_FiveMQos_NLA" $p "DoNotUseNLA"
+        Set-RegValue $p "DoNotUseNLA" 1 | Out-Null
+        foreach ($procName in @("FiveM.exe","FiveM_GTAProcess.exe")) {
+            $polName = "SyncProject FiveM Priority - $procName"
+            Get-NetQosPolicy -Name $polName -ErrorAction SilentlyContinue | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue
+            New-NetQosPolicy -Name $polName -AppPathNameMatchCondition $procName -DSCPAction 46 -NetworkProfile All -ErrorAction SilentlyContinue | Out-Null
+        }
+        Add-Log "FiveM QoS priority tags applied"
+    } catch {}
+
+    # --- Input Lag ---
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Services\kbdclass\Parameters"
+        Save-Orig "KbQueue" $p "KeyboardDataQueueSize"
+        Set-RegValue $p "KeyboardDataQueueSize" 10 | Out-Null
+        Add-Log "Keyboard queue -> 10"
+    } catch {}
+
+    try {
+        Set-RegValue "HKCU:\Control Panel\Mouse" "MouseSpeed" "0" "String" | Out-Null
+        Set-RegValue "HKCU:\Control Panel\Mouse" "MouseThreshold1" "0" "String" | Out-Null
+        Set-RegValue "HKCU:\Control Panel\Mouse" "MouseThreshold2" "0" "String" | Out-Null
+        Add-Log "Mouse acceleration disabled"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Services\USB"
+        Save-Orig "NET_USBSelSuspend" $p "DisableSelectiveSuspend"
+        Set-RegValue $p "DisableSelectiveSuspend" 1 | Out-Null
+        Add-Log "USB selective suspend off"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters"
+        Save-Orig "GM_MouseQueue" $p "MouseDataQueueSize"
+        Set-RegValue $p "MouseDataQueueSize" 100 | Out-Null
+        Add-Log "Mouse data queue -> 100 (safe)"
+    } catch {}
+
+    try {
+        Set-RegValue "HKCU:\Control Panel\Accessibility\StickyKeys" "Flags" "58" "String" | Out-Null
+        Set-RegValue "HKCU:\Control Panel\Accessibility\ToggleKeys" "Flags" "58" "String" | Out-Null
+        Set-RegValue "HKCU:\Control Panel\Accessibility\Keyboard Response" "Flags" "58" "String" | Out-Null
+        Add-Log "Sticky/Toggle/Filter Keys disabled"
+    } catch {}
+
+    # --- System & Timing ---
+    try {
+        bcdedit /set useplatformtick yes 2>&1 | Out-Null
+        bcdedit /set disabledynamictick yes 2>&1 | Out-Null
+        Add-Log "BCD timer tweaks applied (reboot recommended)"
+    } catch {}
+
+    try {
+        bcdedit /set useplatformclock false 2>&1 | Out-Null
+        Add-Log "HPET / dynamic tick disabled (reboot recommended)"
+    } catch {}
+
+    try {
+        Set-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" "PowerThrottlingOff" 1 | Out-Null
+        Add-Log "Power throttling off"
+    } catch {}
+
+    try {
+        $srcGuid = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+        $dup = powercfg /duplicatescheme $srcGuid 2>&1
+        $guid = [regex]::Match("$dup", "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").Value
+        if ($guid) {
+            $Global:OrigMisc["PWR_UltimatePlanGuid"] = $guid
+            powercfg /setactive $guid 2>&1 | Out-Null
+            Add-Log "Ultimate Performance power plan active"
+        }
+    } catch {}
+
+    try {
+        powercfg /setacvalueindex scheme_current sub_processor 0cc5b647-c1df-4637-891a-dec35c318583 100 2>&1 | Out-Null
+        powercfg /setdcvalueindex scheme_current sub_processor 0cc5b647-c1df-4637-891a-dec35c318583 100 2>&1 | Out-Null
+        powercfg /setactive scheme_current 2>&1 | Out-Null
+        Add-Log "CPU core parking disabled"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        Save-Orig "SYS_PauseUpdates" $p "NoAutoRebootWithLoggedOnUsers"
+        Set-RegValue $p "NoAutoRebootWithLoggedOnUsers" 1 | Out-Null
+        Add-Log "Windows Update auto-restart blocked"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl"
+        Save-Orig "SYS_Win32Priority" $p "Win32PrioritySeparation"
+        Set-RegValue $p "Win32PrioritySeparation" 0xFA322A | Out-Null
+        Add-Log "Win32PrioritySeparation -> lowest input lag"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"
+        Save-Orig "SYS_NoBackgroundApps" $p "LetAppsRunInBackground"
+        Set-RegValue $p "LetAppsRunInBackground" 2 | Out-Null
+        Add-Log "UWP background apps blocked"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
+        Save-Orig "SYS_NoBkgndGPRefresh" $p "DisableBkGndGroupPolicy"
+        Set-RegValue $p "DisableBkGndGroupPolicy" 1 | Out-Null
+        Save-Orig "SYS_NoSmartScreenCheck" $p "EnableSmartScreen"
+        Set-RegValue $p "EnableSmartScreen" 0 | Out-Null
+        Add-Log "Background GP refresh + SmartScreen check off"
+    } catch {}
+
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if (-not $cs.AutomaticManagedPagefile) {
+            Set-CimInstance -CimInstance $cs -Property @{ AutomaticManagedPagefile = $true } -ErrorAction Stop | Out-Null
+        }
+        Add-Log "Page file set to system-managed"
+    } catch {}
+
+    # --- Gaming ---
+    try {
+        Save-OrigService "GamingMemory" "SysMain"
+        Stop-Service SysMain -Force -ErrorAction SilentlyContinue
+        Set-Service SysMain -StartupType Disabled -ErrorAction SilentlyContinue
+        Add-Log "SysMain (Superfetch) disabled"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FiveM_GTAProcess.exe\PerfOptions"
+        Save-Orig "GM_FiveMPerfOptions" $p "CpuPriorityClass"
+        Set-RegValue $p "CpuPriorityClass" 3 | Out-Null
+        Add-Log "FiveM_GTAProcess.exe priority AboveNormal (IFEO)"
+    } catch {}
+
+    try {
+        Set-RegValue "HKCU:\System\GameConfigStore" "GameDVR_FSEBehaviorMode" 2 | Out-Null
+        Set-RegValue "HKCU:\System\GameConfigStore" "GameDVR_HonorUserFSEBehaviorMode" 1 | Out-Null
+        Add-Log "Fullscreen optimizations disabled"
+    } catch {}
+
+    try {
+        Set-RegValue "HKLM:\SOFTWARE\Microsoft\Windows\Dwm" "OverlayTestMode" 5 | Out-Null
+        Add-Log "MPO (Multi-Plane Overlay) disabled"
+    } catch {}
+
+    try {
+        $p = "HKCU:\SOFTWARE\Microsoft\GameBar"
+        Save-Orig "GM_GameMode" $p "AutoGameModeEnabled"
+        Set-RegValue $p "AutoGameModeEnabled" 1 | Out-Null
+        Save-Orig "GM_GameBarOff_Nexus" $p "UseNexusForGameBarEnabled"
+        Set-RegValue $p "UseNexusForGameBarEnabled" 0 | Out-Null
+        Save-Orig "GM_GameBarOff_Startup" $p "ShowStartupPanel"
+        Set-RegValue $p "ShowStartupPanel" 0 | Out-Null
+        Add-Log "Game Mode on + Game Bar off"
+    } catch {}
+
+    try {
+        $p1 = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR"
+        Save-Orig "GM_NoGameDVR_App" $p1 "AppCaptureEnabled"
+        Set-RegValue $p1 "AppCaptureEnabled" 0 | Out-Null
+        $p2 = "HKCU:\System\GameConfigStore"
+        Save-Orig "GM_NoGameDVR_Cfg" $p2 "GameDVR_Enabled"
+        Set-RegValue $p2 "GameDVR_Enabled" 0 | Out-Null
+        Add-Log "Game DVR disabled"
+    } catch {}
+
+    try {
+        $p = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
+        Set-RegValue $p "GPU Priority" 8 | Out-Null
+        Set-RegValue $p "Priority" 6 | Out-Null
+        Set-RegValue $p "Scheduling Category" "High" "String" | Out-Null
+        Set-RegValue $p "SFIO Priority" "High" "String" | Out-Null
+        Set-RegValue $p "Background Only" "False" "String" | Out-Null
+        Set-RegValue $p "Clock Rate" 10000 | Out-Null
+        Add-Log "MMCSS Games profile tuned"
+    } catch {}
+
+    try {
+        $candidates = @(
+            "${env:ProgramFiles(x86)}\Steam", "$env:ProgramFiles\Steam",
+            "${env:ProgramFiles(x86)}\Epic Games", "$env:ProgramFiles\Epic Games",
+            "${env:ProgramFiles(x86)}\Riot Games", "$env:ProgramFiles\Riot Games",
+            "$env:LOCALAPPDATA\FiveM"
+        )
+        $added = 0
+        foreach ($pp in $candidates) {
+            if ($pp -and (Test-Path $pp)) {
+                try { Add-MpPreference -ExclusionPath $pp -ErrorAction Stop; $added++ } catch {}
+            }
+        }
+        if ($added -gt 0) { Add-Log "Defender exclusions added ($added folders)" }
+    } catch {}
+
+    # --- UX / Cleanup services ---
+    try {
+        Set-RegValue "HKCU:\Control Panel\Desktop" "MenuShowDelay" "0" "String" | Out-Null
+        Add-Log "Menu delay -> 0ms"
+    } catch {}
+
+    try {
+        Set-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\PushNotifications" "ToastEnabled" 0 | Out-Null
+        Add-Log "Toast notifications disabled"
+    } catch {}
+
+    try {
+        Save-OrigService "CLEAN_NoWER" "WerSvc"
+        Stop-Service WerSvc -Force -ErrorAction SilentlyContinue
+        Set-Service WerSvc -StartupType Disabled -ErrorAction SilentlyContinue
+        Add-Log "Windows Error Reporting disabled"
+    } catch {}
+
+    try {
+        Save-OrigService "CLEAN_NoTelemetry" "DiagTrack"
+        Stop-Service DiagTrack -Force -ErrorAction SilentlyContinue
+        Set-Service DiagTrack -StartupType Disabled -ErrorAction SilentlyContinue
+        Add-Log "Telemetry (DiagTrack) disabled"
+    } catch {}
+
+    try {
+        Save-OrigService "CLEAN_NoSearchIndex" "WSearch"
+        Stop-Service WSearch -Force -ErrorAction SilentlyContinue
+        Set-Service WSearch -StartupType Disabled -ErrorAction SilentlyContinue
+        Add-Log "Windows Search indexing disabled"
+    } catch {}
+
+    try {
+        $p = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy"
+        Save-Orig "CLEAN_NoStorageSense" $p "01"
+        Set-RegValue $p "01" 0 | Out-Null
+        Add-Log "Storage Sense disabled"
+    } catch {}
+
+    try {
+        Disable-ScheduledTask -TaskName "\Microsoft\Windows\TaskScheduler\Regular Maintenance" -ErrorAction SilentlyContinue | Out-Null
+        Add-Log "Background maintenance task disabled"
+    } catch {}
+
+    # FiveM cache clear
+    try {
+        $p = "$env:LOCALAPPDATA\FiveM\FiveM.app\data\cache"
+        if (Test-Path $p) {
+            Remove-Item -Path "$p\*" -Force -Recurse -ErrorAction SilentlyContinue
+            Add-Log "FiveM cache cleared"
+        }
+    } catch {}
+
+    # GPU TDR
+    try {
+        $p = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+        Save-Orig "GPU_TdrDelay" $p "TdrDelay"
+        Set-RegValue $p "TdrDelay" 8 | Out-Null
+        Add-Log "GPU TDR delay -> 8s"
+    } catch {}
+
+    # Detect GPU and apply vendor tweaks
+    try {
+        $gpuNames = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+        $hasNvidia = [bool]($gpuNames -match "NVIDIA")
+        $hasAmd    = [bool]($gpuNames -match "AMD|ATI|Radeon")
+
+        if ($hasNvidia) {
+            try {
+                Stop-Service NvTelemetryContainer -Force -ErrorAction SilentlyContinue
+                Set-Service NvTelemetryContainer -StartupType Disabled -ErrorAction SilentlyContinue
+                Add-Log "NVIDIA telemetry disabled"
+            } catch {}
+            try {
+                $path = "HKCU:\SOFTWARE\NVIDIA Corporation\Global\ShadowPlay\NVSPCAPS"
+                Save-Orig "GPU_NvidiaOverlayOff" $path "value"
+                Set-RegValue $path "value" 0 | Out-Null
+                Add-Log "NVIDIA overlay disabled"
+            } catch {}
+        }
+        if ($hasAmd) {
+            try {
+                Stop-Service "AMD External Events Utility Service" -Force -ErrorAction SilentlyContinue
+                Set-Service "AMD External Events Utility Service" -StartupType Disabled -ErrorAction SilentlyContinue
+                Add-Log "AMD External Events Utility disabled"
+            } catch {}
+            try {
+                Stop-Service "AMD Crash Defender Service" -Force -ErrorAction SilentlyContinue
+                Set-Service "AMD Crash Defender Service" -StartupType Disabled -ErrorAction SilentlyContinue
+                Add-Log "AMD Crash Defender disabled"
+            } catch {}
+        }
+    } catch {}
+
+    $Global:AppliedKeys["ApplyAll"] = $true
+    Save-TweakState
+    Add-Log "=== APPLY COMPLETE ===" "#4ADE80"
+    Add-Log "Some tweaks (BCD/HPET) need a reboot to fully take effect." "#FBBF24"
+    Set-Status "READY"
+}
+
+# ============================================================
+#  CLEAN
+# ============================================================
+function Invoke-Clean {
+    Set-Status "CLEANING..."
+    Add-Log "=== CLEAN ===" "#38BDF8"
+
+    # Temp files
+    try {
+        $paths = @($env:TEMP, "$env:WINDIR\Temp")
+        foreach ($p in $paths) {
+            if (Test-Path $p) { Remove-Item -Path "$p\*" -Force -Recurse -ErrorAction SilentlyContinue }
+        }
+        Add-Log "Temp / junk files cleared"
+    } catch { Add-Log "Temp clean partial" "#F87171" }
+
+    # FiveM cache
+    try {
+        $p = "$env:LOCALAPPDATA\FiveM\FiveM.app\data\cache"
+        if (Test-Path $p) {
+            Remove-Item -Path "$p\*" -Force -Recurse -ErrorAction SilentlyContinue
+            Add-Log "FiveM cache cleared"
+        } else { Add-Log "FiveM cache not found - skipped" "#6B7280" }
+    } catch {}
+
+    # Shader cache
+    try {
+        $shaderPaths = @(
+            "$env:LOCALAPPDATA\NVIDIA\DXCache", "$env:LOCALAPPDATA\NVIDIA\GLCache",
+            "$env:LOCALAPPDATA\NVIDIA Corporation\NV_Cache",
+            "$env:LOCALAPPDATA\AMD\DxCache", "$env:LOCALAPPDATA\AMD\DxcCache",
+            "$env:LOCALAPPDATA\AMD\GLCache", "$env:LOCALAPPDATA\AMD\VkCache"
+        )
+        $found = 0
+        foreach ($p in $shaderPaths) {
+            if (Test-Path $p) {
+                Remove-Item -Path "$p\*" -Force -Recurse -ErrorAction SilentlyContinue
+                $found++
+            }
+        }
+        if ($found -gt 0) { Add-Log "Shader cache cleared ($found folder(s))" }
+        else { Add-Log "No shader cache found" "#6B7280" }
+    } catch {}
+
+    # Kill non-essential background processes
+    $killList = @(
+        "OneDrive","Spotify","SpotifyWebHelper","Discord","DiscordCanary","DiscordPTB","Skype","Teams",
+        "SteamWebHelper","EpicGamesLauncher","EpicWebHelper","OriginWebHelperService","UbisoftConnectWebHelper",
+        "GoogleCrashHandler","GoogleCrashHandler64","GoogleUpdate","AdobeUpdateService","AdobeIPCBroker",
+        "OneDriveStandaloneUpdater","YourPhone","GameBar","GameBarFTServer","XboxAppServices",
+        "NVIDIA GeForce Experience","AMDRSSrcExt","Dropbox","Cortana","SearchApp","WidgetService","Widgets"
+    )
+    $closed = 0
+    foreach ($name in $killList) {
+        try {
+            $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+            if ($procs) {
+                $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+                $closed += @($procs).Count
+            }
+        } catch {}
+    }
+    Add-Log "Background processes closed: $closed"
+
+    # Disable launcher startup
+    $targets = @("Steam","Discord","Epic","Battle.net","Origin","Ubisoft","Uplay","Riot","GOG","Spotify")
+    $runPaths = @(
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"
+    )
+    $removed = 0
+    $backup = @()
+    foreach ($rp in $runPaths) {
+        try {
+            if (-not (Test-Path $rp)) { continue }
+            $props = Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+            foreach ($name in $props.PSObject.Properties.Name) {
+                if ($name -in @("PSPath","PSParentPath","PSChildName","PSDrive","PSProvider")) { continue }
+                foreach ($t in $targets) {
+                    if ($name -match [regex]::Escape($t)) {
+                        $val = $props.$name
+                        $backup += @{ Path = $rp; Name = $name; Value = $val }
+                        try {
+                            Remove-ItemProperty -Path $rp -Name $name -ErrorAction Stop
+                            $removed++
+                            Add-Log "Startup disabled: $name"
+                        } catch {}
+                        break
+                    }
+                }
+            }
+        } catch {}
+    }
+    if ($backup.Count -gt 0) { $Global:OrigMisc["CLEAN_DisableLauncherStartup"] = $backup }
+    if ($removed -gt 0) { Add-Log "Startup entries removed: $removed" }
+    else { Add-Log "No matching startup entries found" "#6B7280" }
+
+    # Prefetch / recent
+    try {
+        Remove-Item "$env:SystemRoot\Prefetch\*" -Force -ErrorAction SilentlyContinue
+        Add-Log "Prefetch cleared"
+    } catch {}
+
+    Save-TweakState
+    Add-Log "=== CLEAN COMPLETE ===" "#4ADE80"
+    Set-Status "READY"
+}
+
+# ============================================================
+#  RESTORE
+# ============================================================
+function Invoke-Restore {
+    Set-Status "RESTORING..."
+    Add-Log "=== RESTORE DEFAULTS ===" "#38BDF8"
+    Load-TweakState
+
+    $restored = 0
+
+    # Restore registry values
+    if ($Global:Orig -and $Global:Orig.Count -gt 0) {
+        foreach ($key in @($Global:Orig.Keys)) {
+            try {
+                $info = $Global:Orig[$key]
+                if ($null -eq $info) { continue }
+                $path = $info.Path
+                $name = $info.Name
+                $val  = $info.Value
+                if (-not $path -or -not $name) { continue }
+                if ($null -eq $val) {
+                    # Original was missing - remove the value we set
+                    if (Test-Path $path) {
+                        Remove-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue
+                    }
+                } else {
+                    $type = if ($val -is [string]) { "String" } else { "DWord" }
+                    Set-RegValue $path $name $val $type | Out-Null
+                }
+                $restored++
+            } catch {}
+        }
+        Add-Log "Registry values restored: $restored"
+    } else {
+        Add-Log "No saved registry originals found" "#6B7280"
+    }
+
+    # Restore services
+    $svcCount = 0
+    if ($Global:OrigServices -and $Global:OrigServices.Count -gt 0) {
+        foreach ($key in @($Global:OrigServices.Keys)) {
+            try {
+                Restore-OrigService $Global:OrigServices[$key]
+                $svcCount++
+            } catch {}
+        }
+        Add-Log "Services restored: $svcCount"
+    }
+
+    # Restore startup entries
+    if ($Global:OrigMisc.ContainsKey("CLEAN_DisableLauncherStartup")) {
+        $backup = $Global:OrigMisc["CLEAN_DisableLauncherStartup"]
+        $r = 0
+        foreach ($entry in $backup) {
+            try {
+                if (-not (Test-Path $entry.Path)) { New-Item -Path $entry.Path -Force | Out-Null }
+                Set-ItemProperty -Path $entry.Path -Name $entry.Name -Value $entry.Value -Force -ErrorAction Stop
+                $r++
+            } catch {}
+        }
+        Add-Log "Startup entries restored: $r"
+    }
+
+    # Remove FiveM QoS policies
+    try {
+        Get-NetQosPolicy -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "SyncProject FiveM*" } |
+            Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue
+        Add-Log "FiveM QoS policies removed"
+    } catch {}
+
+    # Remove FiveM firewall rules
+    try {
+        Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "SyncProject - FiveM*" } |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        Add-Log "FiveM firewall rules removed"
+    } catch {}
+
+    # Remove IFEO for FiveM
+    try {
+        $ifeo = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FiveM_GTAProcess.exe"
+        if (Test-Path $ifeo) { Remove-Item -Path $ifeo -Recurse -Force -ErrorAction SilentlyContinue }
+        Add-Log "FiveM IFEO priority entry removed"
+    } catch {}
+
+    # Reset common power / network defaults that are safe
+    try {
+        powercfg /setactive SCHEME_BALANCED 2>&1 | Out-Null
+        Add-Log "Power plan set back to Balanced"
+    } catch {}
+
+    try {
+        netsh int tcp set global autotuninglevel=normal 2>&1 | Out-Null
+        Add-Log "TCP auto-tuning reset to normal"
+    } catch {}
+
+    # Clear state so next Apply starts fresh
+    $Global:Orig = @{}
+    $Global:OrigServices = @{}
+    $Global:OrigMisc = @{}
+    $Global:AppliedKeys = @{}
+    Save-TweakState
+
+    Add-Log "=== RESTORE COMPLETE ===" "#4ADE80"
+    Add-Log "A reboot is recommended to fully clear BCD/timer changes." "#FBBF24"
+    Set-Status "READY"
+}
+
+
+# ============================================================
+#  QUEEN PROJECT v2  —  Premium Transparent CMD GUI
+# ============================================================
+[xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Queen Project v2"
+        Height="620" Width="880"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ResizeMode="CanMinimize"
+        FontFamily="Segoe UI"
+        Opacity="0">
+  <Window.Resources>
+    <Storyboard x:Key="FadeIn">
+      <DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.65">
+        <DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction>
+      </DoubleAnimation>
+    </Storyboard>
+    <Storyboard x:Key="BorderPulse" RepeatBehavior="Forever">
+      <ColorAnimation Storyboard.TargetName="GlowBrush" Storyboard.TargetProperty="Color"
+                      From="#55A855F7" To="#99E879F9" Duration="0:0:2.4" AutoReverse="True"/>
+    </Storyboard>
+    <Storyboard x:Key="StatusPulse" RepeatBehavior="Forever">
+      <DoubleAnimation Storyboard.TargetName="StatusDot" Storyboard.TargetProperty="Opacity"
+                       From="1" To="0.3" Duration="0:0:1.0" AutoReverse="True"/>
+      <DoubleAnimation Storyboard.TargetName="StatusDot" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)"
+                       From="1" To="1.5" Duration="0:0:1.0" AutoReverse="True"/>
+      <DoubleAnimation Storyboard.TargetName="StatusDot" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)"
+                       From="1" To="1.5" Duration="0:0:1.0" AutoReverse="True"/>
+    </Storyboard>
+    <Storyboard x:Key="CrownGlow" RepeatBehavior="Forever">
+      <DoubleAnimation Storyboard.TargetName="CrownIcon" Storyboard.TargetProperty="Opacity"
+                       From="0.85" To="1" Duration="0:0:1.6" AutoReverse="True"/>
+    </Storyboard>
+    <Storyboard x:Key="ScanLineMove" RepeatBehavior="Forever">
+      <DoubleAnimation Storyboard.TargetName="ScanLine" Storyboard.TargetProperty="(Canvas.Top)"
+                       From="-4" To="600" Duration="0:0:5.5"/>
+    </Storyboard>
+    <!-- Diagonal shine sweep across window -->
+    <Storyboard x:Key="ShineSweep" RepeatBehavior="Forever">
+      <DoubleAnimation Storyboard.TargetName="ShineTransform" Storyboard.TargetProperty="X"
+                       From="-420" To="1100" Duration="0:0:4.2">
+        <DoubleAnimation.EasingFunction><SineEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction>
+      </DoubleAnimation>
+      <DoubleAnimation Storyboard.TargetName="ShineLayer" Storyboard.TargetProperty="Opacity"
+                       From="0" To="0.55" Duration="0:0:0.6" AutoReverse="True"/>
+    </Storyboard>
+    <!-- Reverse shine (opposite direction, slower) -->
+    <Storyboard x:Key="ShineSweep2" RepeatBehavior="Forever">
+      <DoubleAnimation Storyboard.TargetName="ShineTransform2" Storyboard.TargetProperty="X"
+                       From="1100" To="-420" Duration="0:0:6.8">
+        <DoubleAnimation.EasingFunction><SineEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction>
+      </DoubleAnimation>
+    </Storyboard>
+    <!-- Horizontal light beam vertical travel -->
+    <Storyboard x:Key="BeamMove" RepeatBehavior="Forever">
+      <DoubleAnimation Storyboard.TargetName="LightBeam" Storyboard.TargetProperty="(Canvas.Top)"
+                       From="-40" To="650" Duration="0:0:7.5">
+        <DoubleAnimation.EasingFunction><SineEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction>
+      </DoubleAnimation>
+      <DoubleAnimation Storyboard.TargetName="LightBeam" Storyboard.TargetProperty="Opacity"
+                       From="0.05" To="0.38" Duration="0:0:1.5" AutoReverse="True"/>
+    </Storyboard>
+    <!-- Soft top-edge specular shimmer -->
+    <Storyboard x:Key="SpecularPulse" RepeatBehavior="Forever">
+      <DoubleAnimation Storyboard.TargetName="SpecularBar" Storyboard.TargetProperty="Opacity"
+                       From="0.25" To="0.55" Duration="0:0:2.0" AutoReverse="True"/>
+    </Storyboard>
+    <!-- Floor mirror reflection breathe -->
+    <Storyboard x:Key="MirrorPulse" RepeatBehavior="Forever">
+      <DoubleAnimation Storyboard.TargetName="MirrorFloor" Storyboard.TargetProperty="Opacity"
+                       From="0.10" To="0.26" Duration="0:0:2.8" AutoReverse="True"/>
+    </Storyboard>
+  </Window.Resources>
+
+  <Border x:Name="MainBorder" CornerRadius="16" BorderThickness="1.5">
+    <Border.Effect>
+      <DropShadowEffect Color="#C084FC" BlurRadius="22" ShadowDepth="0" Opacity="0.40"/>
+    </Border.Effect>
+    <Border.BorderBrush>
+      <SolidColorBrush x:Name="GlowBrush" Color="#55A855F7"/>
+    </Border.BorderBrush>
+    <Border.Background>
+      <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#F20B0618" Offset="0"/>
+        <GradientStop Color="#F0120A22" Offset="0.5"/>
+        <GradientStop Color="#F00A0614" Offset="1"/>
+      </LinearGradientBrush>
+    </Border.Background>
+    <Grid>
+      <Grid.Clip>
+        <RectangleGeometry x:Name="ClipGeom" Rect="0,0,880,620" RadiusX="16" RadiusY="16"/>
+      </Grid.Clip>
+
+      <!-- Floating orbs -->
+      <Canvas x:Name="OrbCanvas" IsHitTestVisible="False">
+        <Ellipse x:Name="Orb1" Width="220" Height="220" Opacity="0.22">
+          <Ellipse.Fill>
+            <RadialGradientBrush>
+              <GradientStop Color="#C084FC" Offset="0"/>
+              <GradientStop Color="#00C084FC" Offset="1"/>
+            </RadialGradientBrush>
+          </Ellipse.Fill>
+          <Canvas.Left>-20</Canvas.Left><Canvas.Top>60</Canvas.Top>
+        </Ellipse>
+        <Ellipse x:Name="Orb2" Width="180" Height="180" Opacity="0.16">
+          <Ellipse.Fill>
+            <RadialGradientBrush>
+              <GradientStop Color="#E879F9" Offset="0"/>
+              <GradientStop Color="#00E879F9" Offset="1"/>
+            </RadialGradientBrush>
+          </Ellipse.Fill>
+          <Canvas.Left>620</Canvas.Left><Canvas.Top>320</Canvas.Top>
+        </Ellipse>
+        <Ellipse x:Name="Orb3" Width="130" Height="130" Opacity="0.14">
+          <Ellipse.Fill>
+            <RadialGradientBrush>
+              <GradientStop Color="#F0ABFC" Offset="0"/>
+              <GradientStop Color="#00F0ABFC" Offset="1"/>
+            </RadialGradientBrush>
+          </Ellipse.Fill>
+          <Canvas.Left>400</Canvas.Left><Canvas.Top>-10</Canvas.Top>
+        </Ellipse>
+        <Ellipse x:Name="Orb4" Width="90" Height="90" Opacity="0.18">
+          <Ellipse.Fill>
+            <RadialGradientBrush>
+              <GradientStop Color="#A78BFA" Offset="0"/>
+              <GradientStop Color="#00A78BFA" Offset="1"/>
+            </RadialGradientBrush>
+          </Ellipse.Fill>
+          <Canvas.Left>720</Canvas.Left><Canvas.Top>100</Canvas.Top>
+        </Ellipse>
+        <Ellipse x:Name="Orb5" Width="60" Height="60" Opacity="0.12">
+          <Ellipse.Fill>
+            <RadialGradientBrush>
+              <GradientStop Color="#FBBF24" Offset="0"/>
+              <GradientStop Color="#00FBBF24" Offset="1"/>
+            </RadialGradientBrush>
+          </Ellipse.Fill>
+          <Canvas.Left>200</Canvas.Left><Canvas.Top>480</Canvas.Top>
+        </Ellipse>
+        <!-- Scan line -->
+        <Border x:Name="ScanLine" Width="880" Height="2" Opacity="0.12" Canvas.Top="-4" IsHitTestVisible="False">
+          <Border.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+              <GradientStop Color="#00E879F9" Offset="0"/>
+              <GradientStop Color="#AAE879F9" Offset="0.5"/>
+              <GradientStop Color="#00E879F9" Offset="1"/>
+            </LinearGradientBrush>
+          </Border.Background>
+        </Border>
+      </Canvas>
+
+      <!-- ===== LIGHT REFLECTION LAYERS ===== -->
+      <!-- Top specular highlight (glass edge reflection) -->
+      <Border x:Name="SpecularBar" Height="28" VerticalAlignment="Top" IsHitTestVisible="False"
+              CornerRadius="16,16,0,0" Opacity="0.4">
+        <Border.Background>
+          <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+            <GradientStop Color="#55FFFFFF" Offset="0"/>
+            <GradientStop Color="#18FFFFFF" Offset="0.35"/>
+            <GradientStop Color="#00FFFFFF" Offset="1"/>
+          </LinearGradientBrush>
+        </Border.Background>
+      </Border>
+
+      <!-- Moving diagonal shine / light reflection sweep -->
+      <Border x:Name="ShineLayer" IsHitTestVisible="False" Opacity="0.4" ClipToBounds="True">
+        <Border.RenderTransform>
+          <TranslateTransform x:Name="ShineTransform" X="-420" Y="0"/>
+        </Border.RenderTransform>
+        <Border Width="160" HorizontalAlignment="Left">
+          <Border.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+              <GradientStop Color="#00FFFFFF" Offset="0"/>
+              <GradientStop Color="#18F5D0FE" Offset="0.25"/>
+              <GradientStop Color="#55FFFFFF" Offset="0.5"/>
+              <GradientStop Color="#18E879F9" Offset="0.75"/>
+              <GradientStop Color="#00FFFFFF" Offset="1"/>
+            </LinearGradientBrush>
+          </Border.Background>
+          <Border.RenderTransform>
+            <SkewTransform AngleX="-18"/>
+          </Border.RenderTransform>
+        </Border>
+      </Border>
+
+      <!-- Floor mirror reflection (เงาสะท้อนพื้น) -->
+      <Border x:Name="MirrorFloor" Height="100" VerticalAlignment="Bottom" IsHitTestVisible="False"
+              Opacity="0.16" CornerRadius="0,0,16,16">
+        <Border.Background>
+          <LinearGradientBrush StartPoint="0,1" EndPoint="0,0">
+            <GradientStop Color="#55C084FC" Offset="0"/>
+            <GradientStop Color="#33E879F9" Offset="0.25"/>
+            <GradientStop Color="#18A855F7" Offset="0.55"/>
+            <GradientStop Color="#00FFFFFF" Offset="1"/>
+          </LinearGradientBrush>
+        </Border.Background>
+      </Border>
+      <!-- Soft inverted reflection strip (mirror under content) -->
+      <Border Height="14" VerticalAlignment="Bottom" Margin="40,0,40,8" IsHitTestVisible="False"
+              Opacity="0.18" CornerRadius="7">
+        <Border.Effect>
+          <BlurEffect Radius="8"/>
+        </Border.Effect>
+        <Border.Background>
+          <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+            <GradientStop Color="#00FFFFFF" Offset="0"/>
+            <GradientStop Color="#55E879F9" Offset="0.3"/>
+            <GradientStop Color="#88FFFFFF" Offset="0.5"/>
+            <GradientStop Color="#55C084FC" Offset="0.7"/>
+            <GradientStop Color="#00FFFFFF" Offset="1"/>
+          </LinearGradientBrush>
+        </Border.Background>
+      </Border>
+
+      <!-- Reverse diagonal shine -->
+      <Border x:Name="ShineLayer2" IsHitTestVisible="False" Opacity="0.22" ClipToBounds="True">
+        <Border.RenderTransform>
+          <TranslateTransform x:Name="ShineTransform2" X="1100" Y="0"/>
+        </Border.RenderTransform>
+        <Border Width="100" HorizontalAlignment="Left">
+          <Border.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+              <GradientStop Color="#00FFFFFF" Offset="0"/>
+              <GradientStop Color="#22A78BFA" Offset="0.4"/>
+              <GradientStop Color="#44FFFFFF" Offset="0.5"/>
+              <GradientStop Color="#22C084FC" Offset="0.6"/>
+              <GradientStop Color="#00FFFFFF" Offset="1"/>
+            </LinearGradientBrush>
+          </Border.Background>
+          <Border.RenderTransform>
+            <SkewTransform AngleX="22"/>
+          </Border.RenderTransform>
+        </Border>
+      </Border>
+
+      <!-- Moving lights canvas: beam + sparkles -->
+      <Canvas x:Name="LightCanvas" IsHitTestVisible="False" ClipToBounds="True">
+        <!-- Wide horizontal light beam -->
+        <Border x:Name="LightBeam" Width="900" Height="48" Canvas.Left="-10" Canvas.Top="-40" Opacity="0.2">
+          <Border.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#00FFFFFF" Offset="0"/>
+              <GradientStop Color="#33E879F9" Offset="0.35"/>
+              <GradientStop Color="#55FFFFFF" Offset="0.5"/>
+              <GradientStop Color="#28C084FC" Offset="0.65"/>
+              <GradientStop Color="#00FFFFFF" Offset="1"/>
+            </LinearGradientBrush>
+          </Border.Background>
+        </Border>
+        <!-- Sparkle dots -->
+        <Ellipse x:Name="Spark1" Width="4" Height="4" Fill="#FFFFFF" Opacity="0.7" Canvas.Left="120" Canvas.Top="80"/>
+        <Ellipse x:Name="Spark2" Width="3" Height="3" Fill="#F0ABFC" Opacity="0.6" Canvas.Left="340" Canvas.Top="200"/>
+        <Ellipse x:Name="Spark3" Width="5" Height="5" Fill="#E879F9" Opacity="0.5" Canvas.Left="560" Canvas.Top="140"/>
+        <Ellipse x:Name="Spark4" Width="3" Height="3" Fill="#FFFFFF" Opacity="0.8" Canvas.Left="720" Canvas.Top="320"/>
+        <Ellipse x:Name="Spark5" Width="4" Height="4" Fill="#A78BFA" Opacity="0.55" Canvas.Left="220" Canvas.Top="400"/>
+        <Ellipse x:Name="Spark6" Width="3" Height="3" Fill="#FBBF24" Opacity="0.45" Canvas.Left="480" Canvas.Top="90"/>
+        <Ellipse x:Name="Spark7" Width="4" Height="4" Fill="#FFFFFF" Opacity="0.65" Canvas.Left="800" Canvas.Top="250"/>
+        <Ellipse x:Name="Spark8" Width="3" Height="3" Fill="#F5D0FE" Opacity="0.5" Canvas.Left="90" Canvas.Top="500"/>
+        <!-- Soft radial pulse lights -->
+        <Ellipse x:Name="PulseLight1" Width="120" Height="120" Opacity="0.12" Canvas.Left="50" Canvas.Top="150">
+          <Ellipse.Fill>
+            <RadialGradientBrush>
+              <GradientStop Color="#FFFFFF" Offset="0"/>
+              <GradientStop Color="#00FFFFFF" Offset="1"/>
+            </RadialGradientBrush>
+          </Ellipse.Fill>
+        </Ellipse>
+        <Ellipse x:Name="PulseLight2" Width="90" Height="90" Opacity="0.10" Canvas.Left="650" Canvas.Top="280">
+          <Ellipse.Fill>
+            <RadialGradientBrush>
+              <GradientStop Color="#E879F9" Offset="0"/>
+              <GradientStop Color="#00E879F9" Offset="1"/>
+            </RadialGradientBrush>
+          </Ellipse.Fill>
+        </Ellipse>
+      </Canvas>
+
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="56"/>
+          <RowDefinition Height="*"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- ===== TITLE BAR ===== -->
+        <Border Grid.Row="0" CornerRadius="16,16,0,0" BorderThickness="0,0,0,1" BorderBrush="#28C084FC">
+          <Border.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+              <GradientStop Color="#CC100820" Offset="0"/>
+              <GradientStop Color="#CC180C2E" Offset="0.5"/>
+              <GradientStop Color="#CC100820" Offset="1"/>
+            </LinearGradientBrush>
+          </Border.Background>
+          <Grid Margin="18,0">
+            <!-- Title bar inner glass reflection -->
+            <Border Height="1" VerticalAlignment="Top" Margin="-18,0,-18,0" IsHitTestVisible="False" Opacity="0.35">
+              <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                  <GradientStop Color="#00FFFFFF" Offset="0"/>
+                  <GradientStop Color="#88FFFFFF" Offset="0.5"/>
+                  <GradientStop Color="#00FFFFFF" Offset="1"/>
+                </LinearGradientBrush>
+              </Border.Background>
+            </Border>
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+              <!-- Crown -->
+              <Border x:Name="CrownIcon" Width="32" Height="32" CornerRadius="8" Margin="0,0,12,0"
+                      VerticalAlignment="Center" Opacity="0.95">
+                <Border.Effect>
+                  <DropShadowEffect Color="#E879F9" BlurRadius="10" ShadowDepth="0" Opacity="0.50"/>
+                </Border.Effect>
+                <Border.Background>
+                  <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                    <GradientStop Color="#E879F9" Offset="0"/>
+                    <GradientStop Color="#A855F7" Offset="1"/>
+                  </LinearGradientBrush>
+                </Border.Background>
+                <TextBlock Text="♛" FontSize="16" Foreground="#FFFFFF"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Border>
+              <StackPanel VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="QUEEN PROJECT" FontSize="15" FontWeight="Bold"
+                             FontFamily="Segoe UI" VerticalAlignment="Center">
+                    <TextBlock.Foreground>
+                      <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                        <GradientStop Color="#F5D0FE" Offset="0"/>
+                        <GradientStop Color="#E879F9" Offset="0.5"/>
+                        <GradientStop Color="#C084FC" Offset="1"/>
+                      </LinearGradientBrush>
+                    </TextBlock.Foreground>
+                  </TextBlock>
+                  <Border Background="#33E879F9" CornerRadius="4" Padding="6,1" Margin="10,0,0,0" VerticalAlignment="Center">
+                    <TextBlock Text="v2" Foreground="#F0ABFC" FontSize="10" FontWeight="Bold" FontFamily="Consolas"/>
+                  </Border>
+                </StackPanel>
+                <TextBlock Text="FiveM Optimize  ·  CMD Mode" Foreground="#6B5B7A" FontSize="10"
+                           FontFamily="Consolas" Margin="0,1,0,0"/>
+              </StackPanel>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+              <Border Background="#18FFFFFF" CornerRadius="12" Padding="10,4" Margin="0,0,12,0" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal">
+                  <Ellipse x:Name="StatusDot" Width="7" Height="7" Fill="#E879F9" Margin="0,0,6,0"
+                           VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5">
+                    <Ellipse.RenderTransform>
+                      <ScaleTransform ScaleX="1" ScaleY="1"/>
+                    </Ellipse.RenderTransform>
+                  </Ellipse>
+                  <TextBlock x:Name="StatusText" Text="READY" Foreground="#E9D5FF" FontSize="10"
+                             FontWeight="SemiBold" FontFamily="Consolas" VerticalAlignment="Center"/>
+                </StackPanel>
+              </Border>
+              <Button x:Name="BtnMin" Content="─" Width="32" Height="32" Background="Transparent"
+                      Foreground="#7C6B8A" BorderThickness="0" FontSize="11" Cursor="Hand"
+                      FontFamily="Segoe UI" VerticalContentAlignment="Center"/>
+              <Button x:Name="BtnClose" Content="✕" Width="32" Height="32" Background="Transparent"
+                      Foreground="#7C6B8A" BorderThickness="0" FontSize="12" Cursor="Hand"
+                      FontFamily="Segoe UI" VerticalContentAlignment="Center"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <!-- ===== BODY ===== -->
+        <Grid Grid.Row="1" Margin="18,14,18,8">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="268"/>
+            <ColumnDefinition Width="16"/>
+            <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+
+          <!-- LEFT MENU -->
+          <Border Grid.Column="0" CornerRadius="14" BorderThickness="1" BorderBrush="#30C084FC" Padding="16">
+            <Border.Effect>
+              <DropShadowEffect Color="#A855F7" BlurRadius="14" ShadowDepth="4" Direction="270" Opacity="0.32"/>
+            </Border.Effect>
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                <GradientStop Color="#BB140A24" Offset="0"/>
+                <GradientStop Color="#BB0C0618" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+            <Grid>
+            <!-- Panel glass reflection (top edge) -->
+            <Border Height="40" VerticalAlignment="Top" CornerRadius="13,13,0,0" Margin="-16,-16,-16,0"
+                    IsHitTestVisible="False" Opacity="0.22">
+              <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                  <GradientStop Color="#66FFFFFF" Offset="0"/>
+                  <GradientStop Color="#00FFFFFF" Offset="1"/>
+                </LinearGradientBrush>
+              </Border.Background>
+            </Border>
+            <!-- Bottom mirror reflection shadow -->
+            <Border Height="36" VerticalAlignment="Bottom" CornerRadius="0,0,13,13" Margin="-16,0,-16,-16"
+                    IsHitTestVisible="False" Opacity="0.24">
+              <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                  <GradientStop Color="#00C084FC" Offset="0"/>
+                  <GradientStop Color="#33A855F7" Offset="0.5"/>
+                  <GradientStop Color="#00A855F7" Offset="1"/>
+                </LinearGradientBrush>
+              </Border.Background>
+            </Border>
+            <DockPanel>
+              <TextBlock DockPanel.Dock="Top" Text="MENU" Foreground="#A78BFA" FontSize="10"
+                         FontWeight="Bold" FontFamily="Consolas" Margin="2,0,0,12"
+                         Opacity="0.8"/>
+
+              <StackPanel DockPanel.Dock="Bottom" Margin="0,16,0,0">
+                <Border Height="1" Background="#28A855F7" Margin="0,0,0,14"/>
+                <TextBlock Text="SHORTCUTS" Foreground="#5B4B6A" FontSize="9"
+                           FontFamily="Consolas" Margin="0,0,0,6"/>
+                <TextBlock Text="1 Apply  ·  2 Clean&#10;3 Restore  ·  0 Exit"
+                           Foreground="#6B5B7A" FontSize="11" FontFamily="Consolas"
+                           LineHeight="16" TextWrapping="Wrap"/>
+              </StackPanel>
+
+              <StackPanel>
+                <!-- APPLY -->
+                <Button x:Name="Btn1" Height="56" Margin="0,0,0,8" Cursor="Hand" BorderThickness="0"
+                        RenderTransformOrigin="0.5,0.5">
+                  <Button.RenderTransform><ScaleTransform ScaleX="1" ScaleY="1"/></Button.RenderTransform>
+                  <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                      <Border x:Name="Bd" CornerRadius="10" BorderThickness="1" BorderBrush="#28E879F9" Padding="12,0">
+                        <Border.Background>
+                          <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                            <GradientStop Color="#22E879F9" Offset="0"/>
+                            <GradientStop Color="#12A855F7" Offset="1"/>
+                          </LinearGradientBrush>
+                        </Border.Background>
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+                          <Border Grid.Column="0" Width="3" Height="28" CornerRadius="2" Background="#E879F9"
+                                  VerticalAlignment="Center" Margin="0,0,12,0"/>
+                          <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                            <TextBlock Text="APPLY ALL" Foreground="#F5D0FE" FontSize="13"
+                                       FontWeight="Bold" FontFamily="Segoe UI"/>
+                            <TextBlock Text="Full optimize profile" Foreground="#9F7AEA" FontSize="10"
+                                       FontFamily="Consolas" Margin="0,1,0,0"/>
+                          </StackPanel>
+                          <TextBlock Grid.Column="2" Text="[1]" Foreground="#C084FC" FontSize="12"
+                                     FontFamily="Consolas" VerticalAlignment="Center" Opacity="0.7"/>
+                        </Grid>
+                      </Border>
+                      <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                          <Setter TargetName="Bd" Property="BorderBrush" Value="#AAE879F9"/>
+                          <Setter TargetName="Bd" Property="Background">
+                            <Setter.Value>
+                              <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                                <GradientStop Color="#44E879F9" Offset="0"/>
+                                <GradientStop Color="#28A855F7" Offset="1"/>
+                              </LinearGradientBrush>
+                            </Setter.Value>
+                          </Setter>
+                        </Trigger>
+                      </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                  </Button.Template>
+                </Button>
+
+                <!-- CLEAN -->
+                <Button x:Name="Btn2" Height="56" Margin="0,0,0,8" Cursor="Hand" BorderThickness="0"
+                        RenderTransformOrigin="0.5,0.5">
+                  <Button.RenderTransform><ScaleTransform ScaleX="1" ScaleY="1"/></Button.RenderTransform>
+                  <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                      <Border x:Name="Bd" CornerRadius="10" BorderThickness="1" BorderBrush="#2838BDF8" Padding="12,0">
+                        <Border.Background>
+                          <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                            <GradientStop Color="#1838BDF8" Offset="0"/>
+                            <GradientStop Color="#100A1628" Offset="1"/>
+                          </LinearGradientBrush>
+                        </Border.Background>
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+                          <Border Grid.Column="0" Width="3" Height="28" CornerRadius="2" Background="#38BDF8"
+                                  VerticalAlignment="Center" Margin="0,0,12,0"/>
+                          <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                            <TextBlock Text="CLEAN" Foreground="#BAE6FD" FontSize="13"
+                                       FontWeight="Bold" FontFamily="Segoe UI"/>
+                            <TextBlock Text="Cache · Temp · Processes" Foreground="#38BDF8" FontSize="10"
+                                       FontFamily="Consolas" Opacity="0.7" Margin="0,1,0,0"/>
+                          </StackPanel>
+                          <TextBlock Grid.Column="2" Text="[2]" Foreground="#38BDF8" FontSize="12"
+                                     FontFamily="Consolas" VerticalAlignment="Center" Opacity="0.6"/>
+                        </Grid>
+                      </Border>
+                      <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                          <Setter TargetName="Bd" Property="BorderBrush" Value="#8838BDF8"/>
+                          <Setter TargetName="Bd" Property="Background">
+                            <Setter.Value>
+                              <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                                <GradientStop Color="#3838BDF8" Offset="0"/>
+                                <GradientStop Color="#18102030" Offset="1"/>
+                              </LinearGradientBrush>
+                            </Setter.Value>
+                          </Setter>
+                        </Trigger>
+                      </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                  </Button.Template>
+                </Button>
+
+                <!-- RESTORE -->
+                <Button x:Name="Btn3" Height="56" Margin="0,0,0,8" Cursor="Hand" BorderThickness="0"
+                        RenderTransformOrigin="0.5,0.5">
+                  <Button.RenderTransform><ScaleTransform ScaleX="1" ScaleY="1"/></Button.RenderTransform>
+                  <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                      <Border x:Name="Bd" CornerRadius="10" BorderThickness="1" BorderBrush="#28FBBF24" Padding="12,0">
+                        <Border.Background>
+                          <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                            <GradientStop Color="#18FBBF24" Offset="0"/>
+                            <GradientStop Color="#10140C08" Offset="1"/>
+                          </LinearGradientBrush>
+                        </Border.Background>
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+                          <Border Grid.Column="0" Width="3" Height="28" CornerRadius="2" Background="#FBBF24"
+                                  VerticalAlignment="Center" Margin="0,0,12,0"/>
+                          <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                            <TextBlock Text="RESTORE" Foreground="#FDE68A" FontSize="13"
+                                       FontWeight="Bold" FontFamily="Segoe UI"/>
+                            <TextBlock Text="Undo last apply" Foreground="#FBBF24" FontSize="10"
+                                       FontFamily="Consolas" Opacity="0.7" Margin="0,1,0,0"/>
+                          </StackPanel>
+                          <TextBlock Grid.Column="2" Text="[3]" Foreground="#FBBF24" FontSize="12"
+                                     FontFamily="Consolas" VerticalAlignment="Center" Opacity="0.6"/>
+                        </Grid>
+                      </Border>
+                      <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                          <Setter TargetName="Bd" Property="BorderBrush" Value="#88FBBF24"/>
+                          <Setter TargetName="Bd" Property="Background">
+                            <Setter.Value>
+                              <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                                <GradientStop Color="#38FBBF24" Offset="0"/>
+                                <GradientStop Color="#18181008" Offset="1"/>
+                              </LinearGradientBrush>
+                            </Setter.Value>
+                          </Setter>
+                        </Trigger>
+                      </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                  </Button.Template>
+                </Button>
+
+                <!-- EXIT -->
+                <Button x:Name="Btn0" Height="44" Margin="0,4,0,0" Cursor="Hand" BorderThickness="0"
+                        RenderTransformOrigin="0.5,0.5">
+                  <Button.RenderTransform><ScaleTransform ScaleX="1" ScaleY="1"/></Button.RenderTransform>
+                  <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                      <Border x:Name="Bd" CornerRadius="10" BorderThickness="1" BorderBrush="#28F87171"
+                              Background="#12080810" Padding="12,0">
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+                          <TextBlock Grid.Column="0" Text="EXIT" Foreground="#FCA5A5" FontSize="12"
+                                     FontWeight="SemiBold" FontFamily="Segoe UI" VerticalAlignment="Center"/>
+                          <TextBlock Grid.Column="1" Text="[0]" Foreground="#F87171" FontSize="11"
+                                     FontFamily="Consolas" VerticalAlignment="Center" Opacity="0.55"/>
+                        </Grid>
+                      </Border>
+                      <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                          <Setter TargetName="Bd" Property="BorderBrush" Value="#77F87171"/>
+                          <Setter TargetName="Bd" Property="Background" Value="#28F87171"/>
+                        </Trigger>
+                      </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                  </Button.Template>
+                </Button>
+              </StackPanel>
+            </DockPanel>
+            </Grid>
+          </Border>
+
+          <!-- RIGHT LOG PANEL -->
+          <Border Grid.Column="2" CornerRadius="14" BorderThickness="1" BorderBrush="#30C084FC" Padding="16">
+            <Border.Effect>
+              <DropShadowEffect Color="#A855F7" BlurRadius="14" ShadowDepth="4" Direction="270" Opacity="0.32"/>
+            </Border.Effect>
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                <GradientStop Color="#BB100820" Offset="0"/>
+                <GradientStop Color="#BB080510" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+            <Grid>
+            <!-- Panel glass reflection -->
+            <Border Height="40" VerticalAlignment="Top" CornerRadius="13,13,0,0" Margin="-16,-16,-16,0"
+                    IsHitTestVisible="False" Opacity="0.20">
+              <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                  <GradientStop Color="#66FFFFFF" Offset="0"/>
+                  <GradientStop Color="#00FFFFFF" Offset="1"/>
+                </LinearGradientBrush>
+              </Border.Background>
+            </Border>
+            <!-- Bottom mirror reflection shadow -->
+            <Border Height="36" VerticalAlignment="Bottom" CornerRadius="0,0,13,13" Margin="-16,0,-16,-16"
+                    IsHitTestVisible="False" Opacity="0.22">
+              <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                  <GradientStop Color="#00C084FC" Offset="0"/>
+                  <GradientStop Color="#30A855F7" Offset="0.5"/>
+                  <GradientStop Color="#00A855F7" Offset="1"/>
+                </LinearGradientBrush>
+              </Border.Background>
+            </Border>
+            <DockPanel>
+              <Grid DockPanel.Dock="Top" Margin="0,0,0,12">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                  <TextBlock Text="OUTPUT" Foreground="#A78BFA" FontSize="10" FontWeight="Bold"
+                             FontFamily="Consolas" Opacity="0.85"/>
+                  <TextBlock x:Name="LogCursor" Text=" ▌" Foreground="#E879F9" FontSize="10"
+                             FontFamily="Consolas" VerticalAlignment="Center"/>
+                </StackPanel>
+                <TextBlock Text="live console" Foreground="#4C3A5C" FontSize="9"
+                           FontFamily="Consolas" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+              </Grid>
+              <Border CornerRadius="8" Background="#66050810" Padding="12" BorderBrush="#18C084FC" BorderThickness="1">
+                <ScrollViewer x:Name="LogScroller" VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                  <TextBlock x:Name="LogBox" Foreground="#E9D5FF" FontSize="12.5" FontFamily="Consolas"
+                             TextWrapping="Wrap" LineHeight="20"/>
+                </ScrollViewer>
+              </Border>
+            </DockPanel>
+            </Grid>
+          </Border>
+        </Grid>
+
+        <!-- PROGRESS STRIP -->
+        <Border Grid.Row="2" Margin="18,0,18,8" Height="4" CornerRadius="2" Background="#180C1020">
+          <Border x:Name="ProgressFill" CornerRadius="2" HorizontalAlignment="Left" Width="0">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                <GradientStop Color="#A855F7" Offset="0"/>
+                <GradientStop Color="#E879F9" Offset="0.5"/>
+                <GradientStop Color="#F0ABFC" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+          </Border>
+        </Border>
+
+        <!-- FOOTER -->
+        <Border Grid.Row="3" CornerRadius="0,0,16,16" Padding="18,10"
+                BorderThickness="0,1,0,0" BorderBrush="#28C084FC">
+          <Border.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+              <GradientStop Color="#CC100820" Offset="0"/>
+              <GradientStop Color="#CC180C2E" Offset="0.5"/>
+              <GradientStop Color="#CC100820" Offset="1"/>
+            </LinearGradientBrush>
+          </Border.Background>
+          <Grid>
+            <TextBlock Text="♛  Queen Project v2  ·  Client-side only  ·  Does not change server / ISP ping"
+                       Foreground="#5B4B6A" FontSize="10" FontFamily="Consolas"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Grid>
+        </Border>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+"@
+
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+# Keep clip geometry in sync on resize
+$window.Add_SizeChanged({
+    $g = $window.FindName("ClipGeom")
+    if ($g) { $g.Rect = New-Object System.Windows.Rect(0, 0, $window.ActualWidth, $window.ActualHeight) }
+})
+
+$Global:LogBox      = $window.FindName("LogBox")
+$Global:LogScroller = $window.FindName("LogScroller")
+$Global:StatusText  = $window.FindName("StatusText")
+$Global:ProgressFill = $window.FindName("ProgressFill")
+$Btn1     = $window.FindName("Btn1")
+$Btn2     = $window.FindName("Btn2")
+$Btn3     = $window.FindName("Btn3")
+$Btn0     = $window.FindName("Btn0")
+$BtnMin   = $window.FindName("BtnMin")
+$BtnClose = $window.FindName("BtnClose")
+$MainBorder = $window.FindName("MainBorder")
+$StatusDot  = $window.FindName("StatusDot")
+$LogCursor  = $window.FindName("LogCursor")
+$Orb1 = $window.FindName("Orb1")
+$Orb2 = $window.FindName("Orb2")
+$Orb3 = $window.FindName("Orb3")
+$Orb4 = $window.FindName("Orb4")
+$Orb5 = $window.FindName("Orb5")
+$ScanLine = $window.FindName("ScanLine")
+$CrownIcon = $window.FindName("CrownIcon")
+$Spark1 = $window.FindName("Spark1")
+$Spark2 = $window.FindName("Spark2")
+$Spark3 = $window.FindName("Spark3")
+$Spark4 = $window.FindName("Spark4")
+$Spark5 = $window.FindName("Spark5")
+$Spark6 = $window.FindName("Spark6")
+$Spark7 = $window.FindName("Spark7")
+$Spark8 = $window.FindName("Spark8")
+$PulseLight1 = $window.FindName("PulseLight1")
+$PulseLight2 = $window.FindName("PulseLight2")
+
+# --- Animations ---
+$fadeIn = $window.Resources["FadeIn"]
+$fadeIn.Begin($window)
+
+try {
+    $window.Resources["BorderPulse"].Begin($window)
+    $window.Resources["StatusPulse"].Begin($window)
+    $window.Resources["CrownGlow"].Begin($window)
+    $window.Resources["ScanLineMove"].Begin($window)
+    $window.Resources["ShineSweep"].Begin($window)
+    $window.Resources["ShineSweep2"].Begin($window)
+    $window.Resources["BeamMove"].Begin($window)
+    $window.Resources["SpecularPulse"].Begin($window)
+    $window.Resources["MirrorPulse"].Begin($window)
+} catch {}
+
+# Cursor blink
+$cursorTimer = New-Object System.Windows.Threading.DispatcherTimer
+$cursorTimer.Interval = [TimeSpan]::FromMilliseconds(480)
+$script:cursorOn = $true
+$cursorTimer.Add_Tick({
+    if ($LogCursor) {
+        $LogCursor.Opacity = if ($script:cursorOn) { 1 } else { 0.12 }
+        $script:cursorOn = -not $script:cursorOn
+    }
+})
+$cursorTimer.Start()
+
+# Floating orbs + sparkles + pulse lights
+$orbTimer = New-Object System.Windows.Threading.DispatcherTimer
+$orbTimer.Interval = [TimeSpan]::FromMilliseconds(32)
+$script:orbT = 0.0
+$orbTimer.Add_Tick({
+    $script:orbT += 0.032
+    $t = $script:orbT
+    try {
+        if ($Orb1) {
+            [System.Windows.Controls.Canvas]::SetLeft($Orb1, -20 + [Math]::Sin($t * 0.45) * 50)
+            [System.Windows.Controls.Canvas]::SetTop($Orb1,   60 + [Math]::Cos($t * 0.32) * 45)
+        }
+        if ($Orb2) {
+            [System.Windows.Controls.Canvas]::SetLeft($Orb2, 620 + [Math]::Cos($t * 0.28) * 60)
+            [System.Windows.Controls.Canvas]::SetTop($Orb2,  320 + [Math]::Sin($t * 0.40) * 40)
+        }
+        if ($Orb3) {
+            [System.Windows.Controls.Canvas]::SetLeft($Orb3, 400 + [Math]::Sin($t * 0.55) * 55)
+            [System.Windows.Controls.Canvas]::SetTop($Orb3,  -10 + [Math]::Cos($t * 0.48) * 30)
+        }
+        if ($Orb4) {
+            [System.Windows.Controls.Canvas]::SetLeft($Orb4, 720 + [Math]::Cos($t * 0.38) * 35)
+            [System.Windows.Controls.Canvas]::SetTop($Orb4,  100 + [Math]::Sin($t * 0.60) * 50)
+        }
+        if ($Orb5) {
+            [System.Windows.Controls.Canvas]::SetLeft($Orb5, 200 + [Math]::Sin($t * 0.33) * 70)
+            [System.Windows.Controls.Canvas]::SetTop($Orb5,  480 + [Math]::Cos($t * 0.42) * 25)
+        }
+        # Sparkles: drift + twinkle
+        $sparks = @(
+            @{E=$Spark1; BX=120; BY=80;  SX=0.7; SY=0.5; TO=0.0},
+            @{E=$Spark2; BX=340; BY=200; SX=0.9; SY=0.6; TO=1.1},
+            @{E=$Spark3; BX=560; BY=140; SX=0.55; SY=0.8; TO=2.0},
+            @{E=$Spark4; BX=720; BY=320; SX=0.4; SY=0.7; TO=0.6},
+            @{E=$Spark5; BX=220; BY=400; SX=0.8; SY=0.45; TO=1.7},
+            @{E=$Spark6; BX=480; BY=90;  SX=0.65; SY=0.9; TO=2.5},
+            @{E=$Spark7; BX=800; BY=250; SX=0.5; SY=0.55; TO=0.3},
+            @{E=$Spark8; BX=90;  BY=500; SX=0.75; SY=0.35; TO=1.4}
+        )
+        foreach ($s in $sparks) {
+            if (-not $s.E) { continue }
+            $tt = $t + $s.TO
+            [System.Windows.Controls.Canvas]::SetLeft($s.E, $s.BX + [Math]::Sin($tt * $s.SX) * 40)
+            [System.Windows.Controls.Canvas]::SetTop($s.E,  $s.BY + [Math]::Cos($tt * $s.SY) * 35)
+            $s.E.Opacity = 0.25 + 0.55 * (([Math]::Sin($tt * 2.8) + 1) * 0.5)
+        }
+        # Soft pulse lights drift + breathe
+        if ($PulseLight1) {
+            [System.Windows.Controls.Canvas]::SetLeft($PulseLight1, 50 + [Math]::Sin($t * 0.25) * 80)
+            [System.Windows.Controls.Canvas]::SetTop($PulseLight1, 150 + [Math]::Cos($t * 0.2) * 60)
+            $PulseLight1.Opacity = 0.06 + 0.10 * (([Math]::Sin($t * 1.1) + 1) * 0.5)
+        }
+        if ($PulseLight2) {
+            [System.Windows.Controls.Canvas]::SetLeft($PulseLight2, 650 + [Math]::Cos($t * 0.22) * 70)
+            [System.Windows.Controls.Canvas]::SetTop($PulseLight2, 280 + [Math]::Sin($t * 0.3) * 55)
+            $PulseLight2.Opacity = 0.05 + 0.12 * (([Math]::Cos($t * 0.9) + 1) * 0.5)
+        }
+    } catch {}
+})
+$orbTimer.Start()
+
+# Progress bar helper (animated fill during long ops - visual only)
+function Set-ProgressBar([double]$pct) {
+    if (-not $Global:ProgressFill) { return }
+    $parent = $Global:ProgressFill.Parent
+    $maxW = if ($parent -and $parent.ActualWidth -gt 0) { $parent.ActualWidth } else { 840 }
+    $target = [Math]::Max(0, [Math]::Min(1, $pct)) * $maxW
+    $anim = New-Object System.Windows.Media.Animation.DoubleAnimation($Global:ProgressFill.Width, $target, [TimeSpan]::FromMilliseconds(400))
+    $anim.EasingFunction = New-Object System.Windows.Media.Animation.QuadraticEase
+    $Global:ProgressFill.BeginAnimation([System.Windows.FrameworkElement]::WidthProperty, $anim)
+}
+
+# Hover scale
+function Add-HoverScale($btn) {
+    if (-not $btn) { return }
+    $btn.Add_MouseEnter({
+        $st = $this.RenderTransform
+        if ($st -is [System.Windows.Media.ScaleTransform]) {
+            $ax = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 1.03, [TimeSpan]::FromMilliseconds(140))
+            $ay = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 1.03, [TimeSpan]::FromMilliseconds(140))
+            $st.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $ax)
+            $st.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $ay)
+        }
+    }.GetNewClosure())
+    $btn.Add_MouseLeave({
+        $st = $this.RenderTransform
+        if ($st -is [System.Windows.Media.ScaleTransform]) {
+            $ax = New-Object System.Windows.Media.Animation.DoubleAnimation($st.ScaleX, 1.0, [TimeSpan]::FromMilliseconds(160))
+            $ay = New-Object System.Windows.Media.Animation.DoubleAnimation($st.ScaleY, 1.0, [TimeSpan]::FromMilliseconds(160))
+            $st.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $ax)
+            $st.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $ay)
+        }
+    }.GetNewClosure())
+}
+Add-HoverScale $Btn1
+Add-HoverScale $Btn2
+Add-HoverScale $Btn3
+Add-HoverScale $Btn0
+
+# Drag
+$window.Add_MouseLeftButtonDown({
+    if ($_.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) {
+        try { $window.DragMove() } catch {}
+    }
+})
+
+function Close-WithFade {
+    $fadeOut = New-Object System.Windows.Media.Animation.DoubleAnimation(1, 0, [TimeSpan]::FromMilliseconds(320))
+    $fadeOut.EasingFunction = New-Object System.Windows.Media.Animation.QuadraticEase
+    $fadeOut.Add_Completed({ $window.Close() })
+    $window.BeginAnimation([System.Windows.Window]::OpacityProperty, $fadeOut)
+}
+
+$BtnMin.Add_Click({ $window.WindowState = [System.Windows.WindowState]::Minimized })
+$BtnClose.Add_Click({ Close-WithFade })
+$Btn0.Add_Click({ Close-WithFade })
+
+# Close button hover red
+$BtnClose.Add_MouseEnter({ $this.Foreground = [System.Windows.Media.Brushes]::IndianRed })
+$BtnClose.Add_MouseLeave({ $this.Foreground = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x7C,0x6B,0x8A)) })
+
+function Run-Safe([scriptblock]$action, [string]$label) {
+    $Btn1.IsEnabled = $false; $Btn2.IsEnabled = $false; $Btn3.IsEnabled = $false
+    Set-ProgressBar 0.08
+    try {
+        & $action
+        Set-ProgressBar 1.0
+        Start-Sleep -Milliseconds 350
+        Set-ProgressBar 0
+    } catch {
+        Add-Log "ERROR during $label : $_" "#F87171"
+        Set-Status "ERROR"
+        Set-ProgressBar 0
+    } finally {
+        $Btn1.IsEnabled = $true; $Btn2.IsEnabled = $true; $Btn3.IsEnabled = $true
+    }
+}
+
+$Btn1.Add_Click({
+    $confirm = [System.Windows.MessageBox]::Show(
+        "Apply the full Queen Project v2 optimize profile now?`n`nThis will change registry, services, network and power settings.`nA System Restore Point is recommended first.`n`nContinue?",
+        "Queen Project v2 — APPLY ALL",
+        [System.Windows.MessageBoxButton]::YesNo,
+        [System.Windows.MessageBoxImage]::Question
+    )
+    if ($confirm -eq [System.Windows.MessageBoxResult]::Yes) {
+        Run-Safe { Invoke-ApplyAll } "APPLY ALL"
+    } else { Add-Log "APPLY cancelled by user." "#FBBF24" }
+})
+
+$Btn2.Add_Click({
+    $confirm = [System.Windows.MessageBox]::Show(
+        "Run CLEAN now?`n`n• Clear Temp and FiveM cache`n• Clear shader cache`n• Close non-essential background apps`n• Disable launcher auto-start`n`nContinue?",
+        "Queen Project v2 — CLEAN",
+        [System.Windows.MessageBoxButton]::YesNo,
+        [System.Windows.MessageBoxImage]::Question
+    )
+    if ($confirm -eq [System.Windows.MessageBoxResult]::Yes) {
+        Run-Safe { Invoke-Clean } "CLEAN"
+    } else { Add-Log "CLEAN cancelled by user." "#FBBF24" }
+})
+
+$Btn3.Add_Click({
+    $confirm = [System.Windows.MessageBox]::Show(
+        "RESTORE all saved originals and reset common settings?`n`nUses values from the last APPLY run.`nSome changes (BCD) still need a reboot.`n`nContinue?",
+        "Queen Project v2 — RESTORE",
+        [System.Windows.MessageBoxButton]::YesNo,
+        [System.Windows.MessageBoxImage]::Warning
+    )
+    if ($confirm -eq [System.Windows.MessageBoxResult]::Yes) {
+        Run-Safe { Invoke-Restore } "RESTORE"
+    } else { Add-Log "RESTORE cancelled by user." "#FBBF24" }
+})
+
+$window.Add_KeyDown({
+    param($s, $e)
+    switch ($e.Key) {
+        ([System.Windows.Input.Key]::D1)      { $Btn1.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))); $e.Handled = $true }
+        ([System.Windows.Input.Key]::NumPad1) { $Btn1.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))); $e.Handled = $true }
+        ([System.Windows.Input.Key]::D2)      { $Btn2.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))); $e.Handled = $true }
+        ([System.Windows.Input.Key]::NumPad2) { $Btn2.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))); $e.Handled = $true }
+        ([System.Windows.Input.Key]::D3)      { $Btn3.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))); $e.Handled = $true }
+        ([System.Windows.Input.Key]::NumPad3) { $Btn3.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))); $e.Handled = $true }
+        ([System.Windows.Input.Key]::D0)      { Close-WithFade; $e.Handled = $true }
+        ([System.Windows.Input.Key]::NumPad0) { Close-WithFade; $e.Handled = $true }
+        ([System.Windows.Input.Key]::Escape)  { Close-WithFade; $e.Handled = $true }
+    }
+})
+
+$window.Add_Closing({
+    try { $cursorTimer.Stop() } catch {}
+    try { $orbTimer.Stop() } catch {}
+})
+
+Add-Log "Queen Project v2 online." "#E879F9"
+Add-Log "Admin elevated  ·  State: $Global:StateDir" "#6B7280"
+Add-Log "Ready. Select [1] APPLY  [2] CLEAN  [3] RESTORE" "#C084FC"
+
+$window.ShowDialog() | Out-Null
